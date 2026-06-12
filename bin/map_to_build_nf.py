@@ -37,7 +37,7 @@ while True:
 def normalize_chrom(c):
     return {"23": "X", "24": "Y", "25": "MT"}.get(str(c).upper(), str(c).upper())
 
-def merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate):
+def merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate, threads=1, memory="4GB"):
 
     """
     Merge GWAS summary stats with reference VCFs by RSID, liftover unmapped variants,
@@ -45,18 +45,29 @@ def merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate):
 
     Parameters:
     - ss (str): Path to summary statistics file
-    - vcf (str): Glob pattern for reference VCF Parquet files
+    - vcf (str): Glob pattern or exact path for reference VCF Parquet files
     - from_build (str): Genome build of the summary stats
     - to_build (str): Target genome build for output
     - chroms (list[str]): List of chromosomes to write output for
-    - coordinate: (Unused)
+    - coordinate: Coordinate system used for liftover
+    - threads (int): Number of DuckDB threads to use
+    - memory (str): DuckDB memory limit (e.g. '8GB')
     """
 
     vcfs = glob.glob(vcf)
-    # read input sumstats file using the duckdb and convert the 23,24,25 into X,Y,MT in the chromsome column
+    if not vcfs:
+        print(f"No parquet reference files found matching: {vcf}")
+        return
+
+    # Configure DuckDB parallelism and memory budget
+    con = duckdb.connect()
+    con.execute(f"SET threads={threads}")
+    con.execute(f"SET memory_limit='{memory}'")
+
+    # read input sumstats file using duckdb and normalise chr 23/24/25 → X/Y/MT
     normalized_chroms = [normalize_chrom(c) for c in chroms]
     chrom_filter = ",".join(f"'{c}'" for c in normalized_chroms)
-    
+
     query = f"""
     SELECT *
     FROM (
@@ -73,7 +84,6 @@ def merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate):
     ) mapped
     WHERE {CHR_DSET} IN ({chrom_filter})
     """
-    con = duckdb.connect()
     ssdf = con.execute(query).df()
 
     # handle the empty input file
@@ -90,45 +100,39 @@ def merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate):
     print("starting rsid mapping")
     print("ssdf with rsid empty?: {}".format(ssdf_with_rsid.empty))
 
-    # if there are records with rsids
-    # Initialize an empty DataFrame for merged results 
+    # Initialize an empty DataFrame for merged results
     merged_vcf = pd.DataFrame()
     if not ssdf_with_rsid.empty:
-        # registers a data frame as a virtual table (view) in a DuckDB connection
+        # Register the rsid-bearing rows as a DuckDB virtual table
         con.register("ssdf_rsid", ssdf_with_rsid)
 
-        # Read the reference VCF files and create a union of them
         files_sql = "[" + ", ".join(f"'{f}'" for f in vcfs) + "]"
         vcf_view = f"(SELECT * FROM read_parquet({files_sql}, union_by_name=true))"
 
-
-         # Step 3: Join once across all VCFs
+        # Single INNER JOIN — gets all matched rows in one parquet scan.
+        # QUALIFY keeps the first VCF hit per rsid (handles rare multi-chr duplicates).
         merged_vcf = con.execute(f"""
-            SELECT 
-                ssdf_rsid.*, 
-                vcf.CHR AS CHR_src, 
-                vcf.POS AS POS_src, 
+            SELECT
+                ssdf_rsid.*,
+                vcf.CHR AS CHR_src,
+                vcf.POS AS POS_src,
                 'rs' AS {HM_CC_DSET}
             FROM ssdf_rsid
-            LEFT JOIN {vcf_view} vcf
-            ON ssdf_rsid.{RSID} = vcf.ID
-            WHERE vcf.ID IS NOT NULL
+            INNER JOIN {vcf_view} vcf
+                ON ssdf_rsid.{RSID} = vcf.ID
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY ssdf_rsid.{RSID} ORDER BY vcf.CHR) = 1
             """).df()
-        
-         # Step 4: Format CHR/POS and save
+        con.close()
+
+        # Format CHR/POS columns
         merged_vcf[CHR_DSET] = merged_vcf["CHR_src"].astype("str").str.replace(r"\..*$", "", regex=True)
         merged_vcf[BP_DSET] = merged_vcf["POS_src"].astype("str").str.replace(r"\..*$", "", regex=True)
-        merged_vcf = merged_vcf[header + [HM_CC_DSET]]  # Add back only needed cols
-        
-        # Step 6: keep the unmapped variants
-        # Unmapped rsIDs
-        ssdf_with_rsid = con.execute(f"""
-                                     SELECT ssdf_rsid.*
-                                     FROM ssdf_rsid
-                                     LEFT JOIN {vcf_view} vcf
-                                     ON ssdf_rsid.{RSID} = vcf.ID
-                                     WHERE vcf.ID IS NULL
-                                     """).df()
+        merged_vcf = merged_vcf[header + [HM_CC_DSET]]
+
+        # Unmapped rsids: set-subtract from original — no second parquet scan needed
+        mapped_rsids = set(merged_vcf[RSID])
+        ssdf_with_rsid = ssdf_with_rsid[~ssdf_with_rsid[RSID].isin(mapped_rsids)].copy()
+    else:
         con.close()
 
     print("finished rsid mapping")
@@ -159,9 +163,10 @@ def merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate):
     combined_df[CHR_DSET] = combined_df[CHR_DSET].astype("str").str.replace("\..*$","",regex=True)
     combined_df[BP_DSET] = combined_df[BP_DSET].astype("str").str.replace("\..*$","",regex=True)
     
-    # 1. Write variants missing CHR or BP to "unmapped"
+    # 1. Write variants missing CHR or BP to "{chrom}.unmapped" (one file per chrom run)
     unmapped_df = combined_df[combined_df[CHR_DSET].isnull() | combined_df[BP_DSET].isnull()].copy()
-    unmapped_outfile = os.path.join("unmapped")
+    chrom_tag = normalized_chroms[0] if len(normalized_chroms) == 1 else "all"
+    unmapped_outfile = os.path.join(f"{chrom_tag}.unmapped")
     unmapped_df.to_csv(unmapped_outfile, sep="\t", index=False, na_rep="NA")
     
     # 2. Write valid variants per chromosome
@@ -219,12 +224,14 @@ def add_column_to_df(df, column, value='NA'):
 def main():
     argparser = argparse.ArgumentParser()
     argparser.add_argument('-f', help='The name of the file to be processed', required=True)
-    argparser.add_argument('-vcf', help='The name of the vcf file', required=True)
+    argparser.add_argument('-vcf', help='The name of the vcf file (glob pattern or exact path)', required=True)
     argparser.add_argument('--log', help='The name of the log file')
     argparser.add_argument('-from_build', help='The original build e.g. "36" for NCBI36 or hg18', required=True)
     argparser.add_argument('-to_build', help='The latest (desired) build e.g. "38"', required=True)
     argparser.add_argument('-chroms', help='A list of chromosomes to process', default=DEFAULT_CHROMS)
     argparser.add_argument('-coordinate', help='index', nargs='?', const="1-based", required=True)
+    argparser.add_argument('--threads', help='Number of DuckDB threads', type=int, default=1)
+    argparser.add_argument('--memory', help='DuckDB memory limit e.g. 8GB', type=str, default='4GB')
     args = argparser.parse_args()
 
     ss = args.f
@@ -232,10 +239,9 @@ def main():
     from_build = args.from_build
     to_build = args.to_build
     chroms = listify_string(args.chroms)
-    coordinate=args.coordinate
+    coordinate = args.coordinate
 
-
-    merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate)
+    merge_ss_vcf(ss, vcf, from_build, to_build, chroms, coordinate, args.threads, args.memory)
 
 
 

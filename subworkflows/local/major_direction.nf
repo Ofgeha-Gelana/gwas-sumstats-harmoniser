@@ -8,94 +8,79 @@ workflow major_direction{
     take:
     chr
     files
-    
+
     main:
-    //input: val(GCST), val(from_build), path(tsv), chr
-    chroms=chr.flatten().map{it.toString().replaceAll("chr","")}.collect()
-    map_to_build(files,chroms)
-    //example: output is [GCST1,[path of 1.merged, path of 2.merged .....]]
+    // Fan out: each (sample, chromosome) pair runs its own map_to_build process.
+    // This replaces the single all-chromosome job, reducing per-process memory ~7x
+    // and allowing all chromosomes to map in parallel.
+    chrom_ch = chr.flatten().map { it.toString().replaceAll("chr", "") }
+    map_to_build(files.combine(chrom_ch))
+
+    // Reshape output: [GCST, chrom, merged, unmapped, yaml]
+    //   → map_chr_ch: [chrN, GCST, merged, yaml]  (same key layout as before)
     map_to_build.out.mapped
-                    .transpose()
-                    .map{tuple(get_chr(it[1]),it[0],it[1],it[3])}
-                    .set{map_chr_ch}
-    // capture unmapped sites for reporting
-    unmapped = map_to_build.out.mapped.map{tuple(it[0],it[2])}
-    
-    //example: out of map_to_build [GCST010681,[1,2,...]] tranpose into [[GCST010681,path 1.merged],[GCST010681,path 2.merged]] and then into [chr1,GCST010681,path 1.merged][chr2,GCST010681,path 2.merged].....
-    
-    Channel.fromPath("${params.ref}/homo_sapiens-chr*.vcf.gz") 
-           .map { prepare_reference (it) }
-           .set{ ref_chr_ch }
-    // joint is still needed in case not all chr are running
-    /* example:
-    homo_sapiens-chr1.vcf.gz ->[chr1, path of homo_sapiens-chr1.vcf.gz] (ref_ch_chr)
-    */
-    
-    count_ch=map_chr_ch.combine(ref_chr_ch,by:0)
-    /* example
-    [chr1, path of homo_sapiens-chr1.vcf.gz] (ref_chr_ch) + 
-    [chr1, GCST1, path of 1.merged] (map_chr_ch)
-    -> [chr1, GCST1, path of 1.merged,path of homo_sapiens-chr1.vcf.gz] (count_ch) 
-    */
-    
+        .map { gcst, chrom, merged, unmapped_file, yaml ->
+            tuple("chr" + chrom, gcst, merged, yaml)
+        }
+        .set { map_chr_ch }
+
+    // Merge per-chromosome unmapped files into one file per GCST for the log.
+    // collectFile(keepHeader:true) concatenates content, keeping the header once.
+    unmapped = map_to_build.out.mapped
+        .map { gcst, chrom, merged, unmapped_file, yaml ->
+            tuple(gcst, unmapped_file)
+        }
+        .collectFile(keepHeader: true) { gcst, uf ->
+            ["${gcst}.unmapped", uf.text]
+        }
+        .map { f -> tuple(f.getBaseName().replace('.unmapped', ''), f) }
+
+    Channel.fromPath("${params.ref}/homo_sapiens-chr*.vcf.gz")
+           .map { prepare_reference(it) }
+           .set { ref_chr_ch }
+
+    count_ch = map_chr_ch.combine(ref_chr_ch, by: 0)
+
     ten_percent_counts(count_ch)
-    // need to count the  number of outputs and wait until all the chromosomes have completed
-    int nchr=params.chrom.size()
-    ten_to_sum=ten_percent_counts.out
+
+    int nchr = params.chrom.size()
+    ten_to_sum = ten_percent_counts.out
                       .ten_sc
                       .groupTuple(by: 0)
-                      .branch{pass:it[1].size()==nchr}
-                      .map{it[0]}
+                      .branch { pass: it[1].size() == nchr }
+                      .map { it[0] }
 
-    // example: ten_to_sum [GCST1],[GCST2].....
     ten_percent_counts_sum(ten_to_sum)
-    //example: output [GCST,path ten_percent.tsv,drop,rerun],[GCST,path ten_percent.tsv,forward,countiune]
-    
-    // determine whether conatin a string in the output txt file
-    ten_percent_counts_sum.out.ten_sum.branch{rerun:it.contains("rerun")
-                                          contiune:it.contains("contiune")}
-                                      .set{branch}
-    
-    //branch rerun
-    /* example: 
-    [GCST, path ten_percent.tsv, drop, rerun] (rerun_branch)
-    [chr1, GCST1, path of 1.merged,path of homo_sapiens-chr1.vcf.gz] (count_ch) 
-    */
-    branch.rerun.map{tuple(it[3],it[0])}.set{all_sc_ch}
-    //example:rerun_branch into: [rerun,GCST1]
-    count_ch.combine(all_sc_ch,by:1).set{rerun_branch}
-    //example: rerun_branch: [GCST1,chr1, path of 1.merged,path of homo_sapiens-chr1.vcf.gz,return]
-    generate_strand_counts(rerun_branch)
-    //example: generate_strand_counts.out.all_sc: [GCST, rerun,path of full_sc]
-    all_to_sum=generate_strand_counts.out.all_sc.collect().map{tuple(it[0],it[1])}.unique()
-    //all_to_sum: [GCST, rerun]
-    summarise_strand_counts(all_to_sum)
-    // example: [GCST,path Full.tsv,drop,contiune],[GCST,path Full.tsv,forward,contiune]
 
-    //branch contiune
-    // [GCST, ten_percent, forward,contiune] (contiune_branch)
-    all_files=summarise_strand_counts.out.all_sum.mix(branch.contiune)
-    //hm_input: [GCST,path ten_percent.tsv,forward,countiune],[GCST,path Full.tsv,reverse,countiune]
-    rearrnaged_count_ch=count_ch.map{tuple(it[1],it[0],it[2],it[3],it[4])}
-    // example: [chr1, GCST1, path of 1.merged,path of homo_sapiens-chr1.vcf.gz] (count_ch) 
-    // example into: [GCST1,chr1,path of merged, path of vcf]
-    all_input=all_files.combine(rearrnaged_count_ch,by:0)
-    //example: [GCST,path ten_percent.tsv,forward,countiune,chr,path of merged, path of vcf]
-    hm_input=all_input.map{it[0,2..7]}
-    direction_sum=all_input.map{it[0..1]}.unique()
+    ten_percent_counts_sum.out.ten_sum.branch { rerun:   it.contains("rerun")
+                                                contiune: it.contains("contiune") }
+                                      .set { branch }
+
+    branch.rerun.map { tuple(it[3], it[0]) }.set { all_sc_ch }
+    count_ch.combine(all_sc_ch, by: 1).set { rerun_branch }
+    generate_strand_counts(rerun_branch)
+
+    all_to_sum = generate_strand_counts.out.all_sc.collect().map { tuple(it[0], it[1]) }.unique()
+    summarise_strand_counts(all_to_sum)
+
+    all_files = summarise_strand_counts.out.all_sum.mix(branch.contiune)
+
+    rearrnaged_count_ch = count_ch.map { tuple(it[1], it[0], it[2], it[3], it[4]) }
+    all_input = all_files.combine(rearrnaged_count_ch, by: 0)
+    hm_input = all_input.map { it[0, 2..7] }
+    direction_sum = all_input.map { it[0..1] }.unique()
 
     emit:
-    hm_input=hm_input
-    direction_sum=direction_sum
-    unmapped=unmapped
+    hm_input     = hm_input
+    direction_sum = direction_sum
+    unmapped     = unmapped
 }
 
-// groovy function
-def prepare_reference (Path input) {
-    // extract chromosome from file path and form a list in list
+// groovy helpers
+def prepare_reference(Path input) {
     return [input.getName().split('-')[1].split('\\.')[0], input]
 }
 
 def get_chr(Path input) {
-    return ("chr"+input.getName().split('\\.')[0])
+    return ("chr" + input.getName().split('\\.')[0])
 }

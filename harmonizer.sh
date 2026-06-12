@@ -336,6 +336,10 @@ REF_DIR_ABS="$(resolve_path "$REF_DIR")"
 cd $SUMSTATS_DIR
 
 echo "==== HARMONISE SUMSTATS ===="
+# Tune the Nextflow master JVM: larger heap + G1GC for long-running pipeline orchestration.
+# NXF_OPTS must be set before nextflow starts — it is NOT read from nextflow.config.
+export NXF_OPTS="${NXF_OPTS:--Xms1g -Xmx8g -XX:+UseG1GC -XX:MaxGCPauseMillis=200}"
+
 nextflow run "$CODE_REPO" -profile standard \
   --harm \
   --ref "$REF_DIR_ABS" \
